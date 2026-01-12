@@ -1,0 +1,14 @@
+[client]
+# 隐藏右上角工具栏（Deploy/Settings等）
+toolbarMode = "minimal"
+
+[server]
+# 运行时配置
+runOnSave = true
+
+[theme]
+# 可选：自定义主题色
+# primaryColor = "#667eea"
+# backgroundColor = "#ffffff"
+# secondaryBackgroundColor = "#f0f2f6"
+# textColor = "#262730"

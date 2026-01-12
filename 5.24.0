@@ -1,0 +1,8 @@
+Collecting plotly
+  Downloading plotly-6.5.0-py3-none-any.whl.metadata (8.5 kB)
+Requirement already satisfied: narwhals>=1.15.1 in d:\my_share\bishe\venv\lib\site-packages (from plotly) (2.14.0)
+Requirement already satisfied: packaging in d:\my_share\bishe\venv\lib\site-packages (from plotly) (25.0)
+Downloading plotly-6.5.0-py3-none-any.whl (9.9 MB)
+   ---------------------------------------- 9.9/9.9 MB 4.0 MB/s eta 0:00:00
+Installing collected packages: plotly
+Successfully installed plotly-6.5.0
