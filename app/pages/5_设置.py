@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT_DIR))
 from backend.config import settings
 from backend.database.crud import DatabaseManager
 from backend.auth.auth_service import AuthService
+from app.auth_cookie import ensure_auth_state_defaults, restore_user_from_cookie
 
 st.set_page_config(
     page_title="设置 - 学习伴侣",
@@ -24,14 +25,21 @@ st.set_page_config(
 
 def init_session():
     """初始化会话"""
+    ensure_auth_state_defaults()
+
+    if "db_manager" not in st.session_state:
+        settings.ensure_directories()
+        st.session_state.db_manager = DatabaseManager(str(settings.database_path))
+
+    restore_status = restore_user_from_cookie(st.session_state.db_manager)
+    if restore_status == "pending":
+        st.info("正在恢复登录状态...")
+        st.stop()
+
     if "user" not in st.session_state or st.session_state.user is None:
         st.warning("请先登录")
         st.switch_page("主页.py")
         return False
-    
-    if "db_manager" not in st.session_state:
-        settings.ensure_directories()
-        st.session_state.db_manager = DatabaseManager(str(settings.database_path))
     
     if "auth_service" not in st.session_state:
         st.session_state.auth_service = AuthService(st.session_state.db_manager)
@@ -94,15 +102,37 @@ def api_settings_section():
         st.markdown(f"状态: {sf_status}")
     
     with col4:
-        st.markdown("#### 配置说明")
-        st.markdown("""
-        请在项目根目录创建 `.env` 文件，并填入以下内容：
-        ```
-        GOOGLE_API_KEY=your_key
-        LLAMA_CLOUD_API_KEY=your_key
-        SILICONFLOW_API_KEY=your_key
-        ```
-        """)
+        st.markdown("#### Antigravity 反代（OpenAI 兼容）")
+        antigravity_base = st.text_input(
+            "API Base",
+            value=(getattr(settings, "ANTIGRAVITY_API_BASE", "") or "").strip(),
+            key="antigravity_base",
+            help="从 Antigravity Tools 的“快速接入/Quick Integration”复制 base_url（通常以 /v1 或 /api/v1 结尾）。",
+        )
+        antigravity_key = st.text_input(
+            "API Key",
+            value="*" * 20 if getattr(settings, "ANTIGRAVITY_API_KEY", "") else "",
+            type="password",
+            key="antigravity_key",
+            help="用于通过 Antigravity 反代调用 Gemini/Claude 等模型（OpenAI 兼容）。",
+        )
+        ag_ok = bool(getattr(settings, "ANTIGRAVITY_API_KEY", "")) and bool((getattr(settings, "ANTIGRAVITY_API_BASE", "") or "").strip())
+        ag_status = "✅ 已配置" if ag_ok else "⚠️ 未配置"
+        st.markdown(f"状态: {ag_status}")
+
+    st.markdown("#### 配置说明")
+    st.markdown(
+        """
+请在项目根目录创建 `.env` 文件，并填入以下内容：
+```
+GOOGLE_API_KEY=your_key
+ANTIGRAVITY_API_KEY=your_key
+ANTIGRAVITY_API_BASE=https://your-antigravity-domain/api/v1
+LLAMA_CLOUD_API_KEY=your_key
+SILICONFLOW_API_KEY=your_key
+```
+"""
+    )
     
     st.info("💡 修改API密钥后需要重启应用才能生效")
 
@@ -223,6 +253,7 @@ def model_preferences_section():
     provider_options = {
         "google": "Google Gemini",
         "siliconflow": "硅基流动 SiliconFlow（OpenAI 兼容）",
+        "antigravity": "Antigravity 反代（OpenAI 兼容）",
     }
 
     module_defs = [
@@ -251,7 +282,7 @@ def model_preferences_section():
         )
 
         # model
-        if provider == "google":
+        if provider in {"google", "antigravity"}:
             model_default = (current.get("model") or settings.LLM_MODEL or "").strip()
         else:
             model_default = (current.get("model") or "Qwen2.5-7B-Instruct").strip()
@@ -289,17 +320,36 @@ def model_preferences_section():
             )
             if not settings.SILICONFLOW_API_KEY:
                 st.warning("当前未配置 `SILICONFLOW_API_KEY`，选择硅基流动模型将无法调用。")
+        elif provider == "antigravity":
+            api_base_default = (current.get("api_base") or getattr(settings, "ANTIGRAVITY_API_BASE", "") or "").strip()
+            api_base = st.text_input(
+                "API Base（必填）",
+                value=api_base_default,
+                key=f"model_pref_api_base_{module_key}",
+                help="从 Antigravity Tools 的“快速接入/Quick Integration”复制 base_url（通常以 /v1 或 /api/v1 结尾）。",
+            )
+            if not getattr(settings, "ANTIGRAVITY_API_KEY", ""):
+                st.warning("当前未配置 `ANTIGRAVITY_API_KEY`，选择 Antigravity 将无法调用。")
+            if not (api_base or "").strip() and not (getattr(settings, "ANTIGRAVITY_API_BASE", "") or "").strip():
+                st.warning("当前未配置 `ANTIGRAVITY_API_BASE`，并且该模块未填写 API Base，将无法调用。")
         else:
             if not settings.GOOGLE_API_KEY:
                 st.warning("当前未配置 `GOOGLE_API_KEY`，选择 Gemini 模型将无法调用。")
 
         # 常见误配置修正：Qwen 不是 Gemini 模型，若选择了 Google provider 会导致 404。
         save_provider = provider
-        save_api_base = api_base if provider == "siliconflow" else None
-        if "qwen" in (model or "").lower() and provider != "siliconflow":
-            st.info("检测到 **Qwen** 模型：保存时将自动切换为 **硅基流动**（避免 Google/Gemini 侧 404）。")
-            save_provider = "siliconflow"
-            save_api_base = api_base or "https://api.siliconflow.cn/v1"
+        save_api_base = api_base if provider in {"siliconflow", "antigravity"} else None
+        openai_compat_providers = {"siliconflow", "antigravity"}
+        if "qwen" in (model or "").lower() and provider not in openai_compat_providers:
+            prefer_antigravity = bool(getattr(settings, "ANTIGRAVITY_API_KEY", "")) and bool((getattr(settings, "ANTIGRAVITY_API_BASE", "") or "").strip())
+            if prefer_antigravity:
+                st.info("检测到 **Qwen** 模型：保存时将自动切换为 **Antigravity（OpenAI兼容）**（避免 Google/Gemini 侧 404）。")
+                save_provider = "antigravity"
+                save_api_base = (api_base or getattr(settings, "ANTIGRAVITY_API_BASE", "") or "").strip() or None
+            else:
+                st.info("检测到 **Qwen** 模型：保存时将自动切换为 **硅基流动**（避免 Google/Gemini 侧 404）。")
+                save_provider = "siliconflow"
+                save_api_base = api_base or "https://api.siliconflow.cn/v1"
 
         col_a, col_b = st.columns([1, 3])
         with col_a:

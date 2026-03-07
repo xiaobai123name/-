@@ -22,6 +22,7 @@ from ..database.crud import DatabaseManager
 
 
 DEFAULT_SILICONFLOW_API_BASE = "https://api.siliconflow.cn/v1"
+OPENAI_COMPAT_PROVIDERS = {"siliconflow", "antigravity"}
 
 
 @dataclass
@@ -32,9 +33,66 @@ class ModuleLLMConfig:
     temperature: float = 0.3
 
 
+def _normalize_message_content(content: Any) -> str:
+    """将不同 SDK 形态的 content 统一转为字符串。"""
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="ignore")
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item.strip():
+                    parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("output_text")
+                if text is not None:
+                    parts.append(str(text))
+                continue
+            text = (
+                getattr(item, "text", None)
+                or getattr(item, "output_text", None)
+                or getattr(item, "content", None)
+            )
+            if text is not None:
+                parts.append(str(text))
+        if parts:
+            return "\n".join(parts).strip()
+    return str(content)
+
+
+class NormalizedChatModel:
+    """
+    统一包装不同厂商模型，确保 invoke/ainvoke/stream 返回字符串 content。
+    """
+
+    def __init__(self, inner_model: Any):
+        self.inner_model = inner_model
+
+    @staticmethod
+    def _to_ai_message(message: Any) -> AIMessage:
+        raw_content = getattr(message, "content", message)
+        return AIMessage(content=_normalize_message_content(raw_content))
+
+    def invoke(self, messages: List[BaseMessage]) -> AIMessage:
+        return self._to_ai_message(self.inner_model.invoke(messages))
+
+    async def ainvoke(self, messages: List[BaseMessage]) -> AIMessage:
+        result = await self.inner_model.ainvoke(messages)
+        return self._to_ai_message(result)
+
+    def stream(self, messages: List[BaseMessage]) -> Iterable[AIMessage]:
+        for chunk in self.inner_model.stream(messages):
+            yield self._to_ai_message(chunk)
+
+
 class SiliconFlowChatModel:
     """
-    极简 OpenAI-compatible Chat Completions 客户端（用于硅基流动）。
+    极简 OpenAI-compatible Chat Completions 客户端。
 
     只实现项目用到的最小接口：
     - invoke(messages) -> AIMessage
@@ -50,13 +108,19 @@ class SiliconFlowChatModel:
         temperature: float = 0.3,
         timeout_sec: float = 60.0,
         max_tokens: Optional[int] = None,
+        provider_label: str = "OpenAI兼容",
+        api_key_env: str = "API_KEY",
+        api_base_env: str = "API_BASE",
     ):
         self.api_key = api_key
         self.model = model
-        self.api_base = (api_base or DEFAULT_SILICONFLOW_API_BASE).rstrip("/")
+        self.api_base = (api_base or "").strip().rstrip("/")
         self.temperature = float(temperature)
         self.timeout_sec = float(timeout_sec)
         self.max_tokens = int(max_tokens) if max_tokens is not None else None
+        self.provider_label = (provider_label or "OpenAI兼容").strip()
+        self.api_key_env = (api_key_env or "API_KEY").strip()
+        self.api_base_env = (api_base_env or "API_BASE").strip()
 
     @staticmethod
     def _to_openai_messages(messages: List[BaseMessage]) -> List[Dict[str, str]]:
@@ -96,9 +160,11 @@ class SiliconFlowChatModel:
 
     def invoke(self, messages: List[BaseMessage]) -> AIMessage:
         if not self.api_key:
-            raise ValueError("未配置硅基流动API密钥（SILICONFLOW_API_KEY）")
+            raise ValueError(f"未配置 {self.provider_label} API密钥（{self.api_key_env}）")
         if not self.model:
-            raise ValueError("未配置硅基流动模型名称")
+            raise ValueError(f"未配置 {self.provider_label} 模型名称")
+        if not self.api_base:
+            raise ValueError(f"未配置 {self.provider_label} API Base（{self.api_base_env}）")
 
         url = f"{self.api_base}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -113,9 +179,11 @@ class SiliconFlowChatModel:
 
     async def ainvoke(self, messages: List[BaseMessage]) -> AIMessage:
         if not self.api_key:
-            raise ValueError("未配置硅基流动API密钥（SILICONFLOW_API_KEY）")
+            raise ValueError(f"未配置 {self.provider_label} API密钥（{self.api_key_env}）")
         if not self.model:
-            raise ValueError("未配置硅基流动模型名称")
+            raise ValueError(f"未配置 {self.provider_label} 模型名称")
+        if not self.api_base:
+            raise ValueError(f"未配置 {self.provider_label} API Base（{self.api_base_env}）")
 
         url = f"{self.api_base}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -166,44 +234,73 @@ class ModelRouter:
         temperature = float(pref.temperature) if pref.temperature is not None else default_temp
 
         # 兼容性修正：如果用户把 Qwen 模型填进了 Google provider，会导致 Gemini 侧 404。
-        # 这里自动将其路由到 SiliconFlow（前提：项目当前只接入 SiliconFlow 的 Qwen）。
-        if provider != "siliconflow" and "qwen" in (model or "").lower():
-            provider = "siliconflow"
-            api_base = api_base or DEFAULT_SILICONFLOW_API_BASE
+        # 这里自动将其路由到 OpenAI-compatible provider（硅基流动 / Antigravity）。
+        if provider not in OPENAI_COMPAT_PROVIDERS and "qwen" in (model or "").lower():
+            if getattr(settings, "ANTIGRAVITY_API_KEY", "") and getattr(settings, "ANTIGRAVITY_API_BASE", ""):
+                provider = "antigravity"
+                api_base = api_base or getattr(settings, "ANTIGRAVITY_API_BASE", "")
+            else:
+                provider = "siliconflow"
+                api_base = api_base or DEFAULT_SILICONFLOW_API_BASE
 
         return ModuleLLMConfig(provider=provider, model=model, api_base=api_base, temperature=temperature)
 
     def get_chat_model(self, user_id: str, module: str, streaming: bool = False):
         cfg = self.get_module_llm_config(user_id=user_id, module=module)
 
-        if cfg.provider == "siliconflow":
-            api_base = cfg.api_base or DEFAULT_SILICONFLOW_API_BASE
+        if cfg.provider in OPENAI_COMPAT_PROVIDERS:
             module_key = (module or "").strip().lower()
-            timeout_sec = (
-                float(getattr(settings, "KG_LLM_TIMEOUT_SEC", 180.0))
-                if module_key == "kg"
-                else float(getattr(settings, "SILICONFLOW_LLM_TIMEOUT_SEC", 60.0))
-            )
-            max_tokens = (
-                int(getattr(settings, "KG_LLM_MAX_TOKENS", 1024))
-                if module_key == "kg"
-                else int(getattr(settings, "SILICONFLOW_LLM_MAX_TOKENS", 1024))
-            )
-            return SiliconFlowChatModel(
+
+            # KG 往往输入更长、输出更大，对所有 OpenAI-compatible provider 都使用更宽松的超时/输出限制
+            if module_key == "kg":
+                timeout_sec = float(getattr(settings, "KG_LLM_TIMEOUT_SEC", 180.0))
+                max_tokens = int(getattr(settings, "KG_LLM_MAX_TOKENS", 1024))
+            else:
+                if cfg.provider == "antigravity":
+                    timeout_sec = float(getattr(settings, "ANTIGRAVITY_LLM_TIMEOUT_SEC", 60.0))
+                    max_tokens = int(getattr(settings, "ANTIGRAVITY_LLM_MAX_TOKENS", 1024))
+                else:
+                    timeout_sec = float(getattr(settings, "SILICONFLOW_LLM_TIMEOUT_SEC", 60.0))
+                    max_tokens = int(getattr(settings, "SILICONFLOW_LLM_MAX_TOKENS", 1024))
+
+            if cfg.provider == "antigravity":
+                api_key = getattr(settings, "ANTIGRAVITY_API_KEY", "")
+                api_base = (cfg.api_base or getattr(settings, "ANTIGRAVITY_API_BASE", "") or "").strip()
+                model = SiliconFlowChatModel(
+                    api_key=api_key,
+                    model=cfg.model,
+                    api_base=api_base,
+                    temperature=cfg.temperature,
+                    timeout_sec=timeout_sec,
+                    max_tokens=max_tokens,
+                    provider_label="Antigravity",
+                    api_key_env="ANTIGRAVITY_API_KEY",
+                    api_base_env="ANTIGRAVITY_API_BASE",
+                )
+                return NormalizedChatModel(model)
+
+            # default: SiliconFlow
+            api_base = cfg.api_base or DEFAULT_SILICONFLOW_API_BASE
+            model = SiliconFlowChatModel(
                 api_key=settings.SILICONFLOW_API_KEY,
                 model=cfg.model,
                 api_base=api_base,
                 temperature=cfg.temperature,
                 timeout_sec=timeout_sec,
                 max_tokens=max_tokens,
+                provider_label="硅基流动",
+                api_key_env="SILICONFLOW_API_KEY",
+                api_base_env="API Base（默认 https://api.siliconflow.cn/v1）",
             )
+            return NormalizedChatModel(model)
 
         # 默认：Google Gemini
-        return ChatGoogleGenerativeAI(
+        model = ChatGoogleGenerativeAI(
             model=cfg.model,
             google_api_key=settings.GOOGLE_API_KEY,
             temperature=cfg.temperature,
             streaming=bool(streaming),
             convert_system_message_to_human=True,
         )
+        return NormalizedChatModel(model)
 

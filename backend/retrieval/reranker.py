@@ -3,11 +3,37 @@
 实现基于置信度的自适应重排序策略
 """
 
+import json
+import time
+from pathlib import Path
+
 import httpx
 from typing import List, Dict, Any, Optional, Tuple
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..config import settings
+
+
+DEBUG_LOG_PATH = settings.BASE_DIR / ".cursor" / "debug.log"
+
+
+def _append_debug_log(hypothesis_id: str, message: str, data: Dict[str, Any]) -> None:
+    """写入本地 NDJSON 调试日志，避免输出敏感信息。"""
+    try:
+        DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "hypothesisId": hypothesis_id,
+            "runId": "rerank-debug",
+            "location": "backend/retrieval/reranker.py",
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        # 调试日志失败不能影响主流程
+        pass
 
 
 class AdaptiveReranker:
@@ -77,9 +103,30 @@ class AdaptiveReranker:
             List[Dict]: 重排序结果
         """
         if not self.api_key:
+            _append_debug_log(
+                "C",
+                "rerank api key missing",
+                {
+                    "api_base": self.api_base,
+                    "model": self.model,
+                    "query_len": len(query or ""),
+                    "documents_count": len(documents or []),
+                },
+            )
             raise ValueError("未配置硅基流动API密钥")
         
         url = f"{self.api_base}/rerank"
+        _append_debug_log(
+            "D",
+            "rerank request start",
+            {
+                "url": url,
+                "model": self.model,
+                "query_len": len(query or ""),
+                "documents_count": len(documents or []),
+                "top_n": top_n or len(documents),
+            },
+        )
         
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -97,6 +144,14 @@ class AdaptiveReranker:
         with httpx.Client(timeout=30.0) as client:
             response = client.post(url, json=payload, headers=headers)
             response.raise_for_status()
+            _append_debug_log(
+                "D",
+                "rerank request success",
+                {
+                    "status_code": response.status_code,
+                    "result_count": len(response.json().get("results", [])),
+                },
+            )
             
         return response.json().get("results", [])
     
@@ -118,10 +173,21 @@ class AdaptiveReranker:
             List[Dict]: 重排序后的结果
         """
         if not results:
+            _append_debug_log("A", "rerank skipped because no results", {"top_k": top_k})
             return []
         
         if not self.api_key:
             # 没有API密钥，返回原结果
+            _append_debug_log(
+                "C",
+                "rerank skipped because api key unavailable",
+                {
+                    "top_k": top_k,
+                    "results_count": len(results),
+                    "api_base": self.api_base,
+                    "model": self.model,
+                },
+            )
             return results[:top_k]
         
         # 提取文档内容
@@ -141,6 +207,16 @@ class AdaptiveReranker:
             
             return reranked
         except Exception as e:
+            _append_debug_log(
+                "D",
+                "rerank request failed",
+                {
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "top_k": top_k,
+                    "results_count": len(results),
+                },
+            )
             print(f"重排序失败，使用原始排序: {e}")
             return results[:top_k]
     
@@ -162,17 +238,46 @@ class AdaptiveReranker:
             Tuple[List[Dict], bool]: (重排序后的结果, 是否执行了重排序)
         """
         if not results:
+            _append_debug_log("A", "adaptive rerank skipped because empty results", {"top_k": top_k})
             return [], False
         
         # 计算置信度
         confidence = self._calculate_confidence(results)
+        score_key = "fusion_score" if "fusion_score" in results[0] else "score"
+        _append_debug_log(
+            "A",
+            "adaptive rerank confidence evaluated",
+            {
+                "results_count": len(results),
+                "top_k": top_k,
+                "score_key": score_key,
+                "top1_score": results[0].get(score_key, 0),
+                "top2_score": results[1].get(score_key, 0) if len(results) > 1 else None,
+                "confidence": confidence,
+                "threshold": self.confidence_threshold,
+                "will_rerank": confidence < self.confidence_threshold,
+            },
+        )
         
         if confidence >= self.confidence_threshold:
             # 高置信度：跳过重排序
+            _append_debug_log(
+                "A",
+                "adaptive rerank skipped because confidence is high",
+                {"confidence": confidence, "threshold": self.confidence_threshold},
+            )
             return results[:top_k], False
         else:
             # 低置信度：执行重排序
             reranked = self.rerank(query, results, top_k)
+            _append_debug_log(
+                "D",
+                "adaptive rerank finished request path",
+                {
+                    "returned_count": len(reranked),
+                    "top_result_has_rerank_score": bool(reranked and ("rerank_score" in reranked[0])),
+                },
+            )
             return reranked, True
     
     def get_retrieval_stats(

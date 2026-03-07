@@ -14,7 +14,7 @@ from langchain_core.runnables import RunnablePassthrough
 from ..config import settings
 from ..retrieval.vector_store import VectorStore
 from ..retrieval.hybrid_retriever import HybridRetriever
-from ..retrieval.reranker import AdaptiveReranker
+from ..retrieval.reranker import AdaptiveReranker, _append_debug_log
 from ..database.crud import DatabaseManager
 from ..llm.router import ModelRouter
 from .prompts import PromptTemplates
@@ -259,6 +259,16 @@ class RAGChain:
             n_results=top_k * 2,
             document_ids=document_ids
         )
+        _append_debug_log(
+            "B",
+            "rag query retrieval finished",
+            {
+                "use_rerank": use_rerank,
+                "retrieved_count": len(retrieved_chunks),
+                "top_k": top_k,
+                "document_filter_count": len(document_ids or []),
+            },
+        )
         
         # 2. 自适应重排序
         was_reranked = False
@@ -269,6 +279,14 @@ class RAGChain:
                 top_k=top_k
             )
         else:
+            _append_debug_log(
+                "B",
+                "rag query skipped adaptive rerank",
+                {
+                    "use_rerank": use_rerank,
+                    "retrieved_count": len(retrieved_chunks),
+                },
+            )
             retrieved_chunks = retrieved_chunks[:top_k]
         
         # 3. 格式化上下文
@@ -360,6 +378,16 @@ class RAGChain:
             n_results=top_k * 2,
             document_ids=document_ids
         )
+        _append_debug_log(
+            "B",
+            "rag stream retrieval finished",
+            {
+                "use_rerank": use_rerank,
+                "retrieved_count": len(retrieved_chunks),
+                "top_k": top_k,
+                "document_filter_count": len(document_ids or []),
+            },
+        )
         
         # 2. 自适应重排序
         was_reranked = False
@@ -370,6 +398,14 @@ class RAGChain:
                 top_k=top_k
             )
         else:
+            _append_debug_log(
+                "B",
+                "rag stream skipped adaptive rerank",
+                {
+                    "use_rerank": use_rerank,
+                    "retrieved_count": len(retrieved_chunks),
+                },
+            )
             retrieved_chunks = retrieved_chunks[:top_k]
         
         # 3. 格式化上下文

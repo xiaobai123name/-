@@ -35,9 +35,13 @@ env/
 .env.local
 .env.*.local
 
+# === 密钥文件 ===
+data/.auth_signing_key
+
 # === IDE ===
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~
@@ -45,6 +49,7 @@ env/
 # === 数据目录 ===
 data/uploads/*
 data/chroma_db/*
+data/snapshots/
 data/*.db
 !data/.gitkeep
 !data/uploads/.gitkeep

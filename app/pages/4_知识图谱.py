@@ -16,6 +16,7 @@ from backend.config import settings
 from backend.database.crud import DatabaseManager
 from backend.retrieval.vector_store import VectorStore
 from backend.learning.kg_builder import KnowledgeGraphBuilder, KnowledgeGraph, EntityType
+from app.auth_cookie import ensure_auth_state_defaults, restore_user_from_cookie
 
 # 导入可视化组件
 try:
@@ -23,27 +24,6 @@ try:
     AGRAPH_AVAILABLE = True
 except ImportError:
     AGRAPH_AVAILABLE = False
-
-# 导入 cookie 管理器
-try:
-    import extra_streamlit_components as stx
-    COOKIE_MANAGER_AVAILABLE = True
-    COOKIE_KEY = "app_user_id"
-    COOKIE_WIDGET_KEY = "app_cookie_manager"
-    _cookie_manager_kg = None
-except ImportError:
-    COOKIE_MANAGER_AVAILABLE = False
-
-
-def get_cookie_manager():
-    """获取 Cookie 管理器实例"""
-    if not COOKIE_MANAGER_AVAILABLE:
-        return None
-    global _cookie_manager_kg
-    if _cookie_manager_kg is None:
-        _cookie_manager_kg = stx.CookieManager(key=COOKIE_WIDGET_KEY)
-    return _cookie_manager_kg
-
 
 st.set_page_config(
     page_title="知识图谱 - 学习伴侣",
@@ -101,23 +81,16 @@ st.markdown("""
 
 def init_session():
     """初始化会话"""
+    ensure_auth_state_defaults()
+
     if "db_manager" not in st.session_state:
         settings.ensure_directories()
         st.session_state.db_manager = DatabaseManager(str(settings.database_path))
-    
-    # 尝试从 cookie 恢复登录状态
-    if ("user" not in st.session_state or st.session_state.user is None) and COOKIE_MANAGER_AVAILABLE:
-        cookie_manager = get_cookie_manager()
-        if cookie_manager:
-            user_id = cookie_manager.get(COOKIE_KEY)
-            if user_id:
-                user = st.session_state.db_manager.get_user_by_id(user_id)
-                if user:
-                    st.session_state.user = {
-                        "id": user.id,
-                        "username": user.username,
-                        "display_name": user.display_name
-                    }
+
+    restore_status = restore_user_from_cookie(st.session_state.db_manager)
+    if restore_status == "pending":
+        st.info("正在恢复登录状态...")
+        st.stop()
     
     if "user" not in st.session_state or st.session_state.user is None:
         st.warning("请先登录")
@@ -171,6 +144,36 @@ def sidebar():
             )
             
             st.session_state.selected_doc_for_kg = doc_options[selected_doc_name]
+
+            align_entities = True
+            if st.session_state.selected_doc_for_kg is None:
+                strategy_map = {
+                    "逐文档构建再合并（默认，稳定）": "per_doc",
+                    "全局chunks一次构建（可能更快）": "global",
+                }
+                cur_strategy = getattr(st.session_state.kg_builder, "multi_doc_strategy", "per_doc")
+                if cur_strategy not in set(strategy_map.values()):
+                    cur_strategy = "per_doc"
+                strategy_labels = list(strategy_map.keys())
+                strategy_index = 0
+                for i, label in enumerate(strategy_labels):
+                    if strategy_map[label] == cur_strategy:
+                        strategy_index = i
+                        break
+
+                strategy_label = st.selectbox(
+                    "全部文档构图策略",
+                    options=strategy_labels,
+                    index=strategy_index,
+                    key="kg_multi_doc_strategy",
+                )
+                st.session_state.kg_builder.multi_doc_strategy = strategy_map[strategy_label]
+
+                align_entities = st.checkbox(
+                    "全部文档时启用实体对齐（更准但更慢、更耗额度）",
+                    value=True,
+                    key="kg_align_entities",
+                )
             
             # 构建图谱按钮
             if st.button("🔨 构建知识图谱", use_container_width=True, type="primary"):
@@ -188,11 +191,14 @@ def sidebar():
                             graph = st.session_state.kg_builder.build_from_documents(
                                 document_ids=doc_ids,
                                 user_id=st.session_state.user["id"],
-                                align_entities=True
+                                align_entities=align_entities
                             )
                         
                         st.session_state.current_graph = graph
                         st.success(f"✅ 构建完成！发现 {len(graph.entities)} 个实体，{len(graph.relations)} 条关系")
+                        build_warning = getattr(graph, "build_warning", None)
+                        if build_warning:
+                            st.warning(build_warning)
                     except Exception as e:
                         st.error(f"构建失败: {str(e)}")
         else:

@@ -16,26 +16,7 @@ from backend.database.crud import DatabaseManager
 from backend.retrieval.vector_store import VectorStore
 from backend.rag.chain import RAGChain
 from backend.learning.socratic_engine import SocraticEngine
-
-# 导入 cookie 管理器
-try:
-    import extra_streamlit_components as stx
-    COOKIE_MANAGER_AVAILABLE = True
-    COOKIE_KEY = "app_user_id"
-    COOKIE_WIDGET_KEY = "app_cookie_manager"
-    _cookie_manager_chat = None  # 模块级缓存
-except ImportError:
-    COOKIE_MANAGER_AVAILABLE = False
-
-
-def get_cookie_manager():
-    """获取 Cookie 管理器实例"""
-    if not COOKIE_MANAGER_AVAILABLE:
-        return None
-    global _cookie_manager_chat
-    if _cookie_manager_chat is None:
-        _cookie_manager_chat = stx.CookieManager(key=COOKIE_WIDGET_KEY)
-    return _cookie_manager_chat
+from app.auth_cookie import ensure_auth_state_defaults, restore_user_from_cookie
 
 st.set_page_config(
     page_title="智能问答 - 学习伴侣",
@@ -46,24 +27,17 @@ st.set_page_config(
 
 def init_session():
     """初始化会话"""
+    ensure_auth_state_defaults()
+
     # 先初始化 db_manager（后面恢复登录需要用）
     if "db_manager" not in st.session_state:
         settings.ensure_directories()
         st.session_state.db_manager = DatabaseManager(str(settings.database_path))
     
-    # 尝试从 cookie 恢复登录状态
-    if ("user" not in st.session_state or st.session_state.user is None) and COOKIE_MANAGER_AVAILABLE and not st.session_state.get("cookie_login_disabled", False):
-        cookie_manager = get_cookie_manager()
-        if cookie_manager:
-            user_id = cookie_manager.get(COOKIE_KEY)
-            if user_id:
-                user = st.session_state.db_manager.get_user_by_id(user_id)
-                if user:
-                    st.session_state.user = {
-                        "id": user.id,
-                        "username": user.username,
-                        "display_name": user.display_name
-                    }
+    restore_status = restore_user_from_cookie(st.session_state.db_manager)
+    if restore_status == "pending":
+        st.info("正在恢复登录状态...")
+        st.stop()
     
     if "user" not in st.session_state or st.session_state.user is None:
         st.warning("请先登录")
@@ -152,6 +126,7 @@ def sidebar():
             st.info("💡 **苏格拉底对话模式**\n\n"
                    "系统将通过引导性问题帮助你自主发现答案，"
                    "而不是直接给出结论。这种方式能加深理解和记忆。")
+            st.caption("说明：苏格拉底模式使用混合检索，但不会调用重排序 API。")
         
         if mode != st.session_state.chat_mode:
             st.session_state.chat_mode = mode
@@ -322,6 +297,7 @@ def handle_normal_qa(prompt: str):
                 
                 full_response = result.answer
                 citations = result.citations
+                rerank_status = "✅ 已触发" if result.was_reranked else "⏭️ 未触发"
                 
                 display_response = full_response
                 if not st.session_state.get("qa_show_inline_citations", False):
@@ -330,6 +306,7 @@ def handle_normal_qa(prompt: str):
                     display_response = re.sub(r"\n{3,}", "\n\n", display_response).strip()
 
                 response_placeholder.markdown(display_response)
+                st.caption(f"检索置信度：{result.confidence:.4f} ｜ 重排序：{rerank_status}")
                 
                 # 显示引用
                 if citations:

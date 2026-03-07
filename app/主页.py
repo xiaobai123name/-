@@ -6,7 +6,7 @@
 import streamlit as st
 from pathlib import Path
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # 添加项目根目录到路径
 ROOT_DIR = Path(__file__).parent.parent
@@ -15,19 +15,12 @@ sys.path.insert(0, str(ROOT_DIR))
 from backend.config import settings
 from backend.database.crud import DatabaseManager
 from backend.auth.auth_service import AuthService
-
-# 导入 cookie 管理器
-try:
-    import extra_streamlit_components as stx
-    COOKIE_MANAGER_AVAILABLE = True
-    COOKIE_KEY = "app_user_id"
-    COOKIE_WIDGET_KEY = "app_cookie_manager"
-    _cookie_manager_main = None  # 模块级缓存，避免重复实例和 key 冲突
-except ImportError:
-    COOKIE_MANAGER_AVAILABLE = False
-    COOKIE_KEY = "app_user_id"
-    COOKIE_WIDGET_KEY = "app_cookie_manager"
-    _cookie_manager_main = None
+from app.auth_cookie import (
+    ensure_auth_state_defaults,
+    restore_user_from_cookie,
+    save_login_cookie,
+    clear_login_cookie,
+)
 
 # 页面配置
 st.set_page_config(
@@ -107,22 +100,9 @@ def load_css():
     st.markdown(css, unsafe_allow_html=True)
 
 
-def get_cookie_manager():
-    """获取 Cookie 管理器实例（缓存避免重复 key）"""
-    if not COOKIE_MANAGER_AVAILABLE:
-        return None
-    global _cookie_manager_main
-    if _cookie_manager_main is None:
-        _cookie_manager_main = stx.CookieManager(key=COOKIE_WIDGET_KEY)
-    return _cookie_manager_main
-
-
 def init_session_state():
     """初始化会话状态"""
-    if "cookie_retry" not in st.session_state:
-        st.session_state.cookie_retry = 0
-    if "cookie_waiting" not in st.session_state:
-        st.session_state.cookie_waiting = False
+    ensure_auth_state_defaults()
     if "db_manager" not in st.session_state:
         settings.ensure_directories()
         st.session_state.db_manager = DatabaseManager(str(settings.database_path))
@@ -132,59 +112,8 @@ def init_session_state():
         st.session_state.current_conversation = None
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    
-    # 尝试从 cookie 恢复登录状态
-    if "user" not in st.session_state:
-        st.session_state.user = None
-    if "cookie_login_disabled" not in st.session_state:
-        st.session_state.cookie_login_disabled = False
-    
-    if st.session_state.user is None and COOKIE_MANAGER_AVAILABLE:
-        cookie_manager = get_cookie_manager()
-        if cookie_manager:
-            user_id = cookie_manager.get(COOKIE_KEY)
-            if user_id:
-                if not st.session_state.get("cookie_login_disabled", False):
-                    user = st.session_state.db_manager.get_user_by_id(user_id)
-                    if user:
-                        st.session_state.user = {
-                            "id": user.id,
-                            "username": user.username,
-                            "display_name": user.display_name
-                        }
-                        st.session_state.cookie_retry = 0
-                        st.session_state.cookie_waiting = False
-                    else:
-                        st.session_state.cookie_retry += 1
-                        st.session_state.cookie_waiting = st.session_state.cookie_retry <= 2
-            else:
-                st.session_state.cookie_retry += 1
-                st.session_state.cookie_waiting = st.session_state.cookie_retry <= 2
 
-
-def save_login_cookie(user_id: str):
-    """保存登录状态到 cookie"""
-    if COOKIE_MANAGER_AVAILABLE:
-        cookie_manager = get_cookie_manager()
-        if cookie_manager:
-            cookie_manager.set(COOKIE_KEY, user_id, expires_at=datetime.now() + timedelta(days=7))
-
-
-def clear_login_cookie():
-    """清除登录 cookie"""
-    if not COOKIE_MANAGER_AVAILABLE:
-        return
-    cookie_manager = get_cookie_manager()
-    if not cookie_manager:
-        return
-    try:
-        cookie_manager.delete(COOKIE_KEY)
-    except Exception:
-        pass
-    try:
-        cookie_manager.set(COOKIE_KEY, "", expires_at=datetime.now() - timedelta(days=1))
-    except Exception:
-        pass
+    return restore_user_from_cookie(st.session_state.db_manager)
 
 
 def login_page():
@@ -500,12 +429,12 @@ def dashboard_page():
 def main():
     """主函数"""
     load_css()
-    init_session_state()
-    
-    # 如果 cookie 需要再尝试恢复，则重跑一次等待 CookieManager 渲染
-    if st.session_state.get("cookie_waiting"):
-        st.session_state.cookie_waiting = False
-        st.rerun()
+    restore_status = init_session_state()
+
+    # CookieManager 首次挂载时，先等待组件完成 cookie 读取并自动 rerun。
+    if restore_status == "pending":
+        st.info("正在恢复登录状态...")
+        st.stop()
     
     if st.session_state.user is None:
         login_page()

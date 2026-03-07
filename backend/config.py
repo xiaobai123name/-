@@ -28,6 +28,15 @@ class Settings(BaseSettings):
     # === 硅基流动 LLM（OpenAI 兼容）配置 ===
     SILICONFLOW_LLM_TIMEOUT_SEC: float = Field(default=60.0, description="硅基流动 Chat Completions 超时（秒）")
     SILICONFLOW_LLM_MAX_TOKENS: int = Field(default=1024, description="硅基流动 Chat Completions 输出最大 tokens")
+
+    # === Antigravity 反代（OpenAI 兼容）===
+    ANTIGRAVITY_API_KEY: str = Field(default="", description="Antigravity 反代 API Key（OpenAI 兼容）")
+    ANTIGRAVITY_API_BASE: str = Field(
+        default="",
+        description="Antigravity 反代 API Base（通常以 /v1 或 /api/v1 结尾）",
+    )
+    ANTIGRAVITY_LLM_TIMEOUT_SEC: float = Field(default=60.0, description="Antigravity Chat Completions 超时（秒）")
+    ANTIGRAVITY_LLM_MAX_TOKENS: int = Field(default=1024, description="Antigravity Chat Completions 输出最大 tokens")
     
     # === 数据库配置 ===
     DATABASE_PATH: str = Field(default="data/learning_companion.db")
@@ -41,7 +50,11 @@ class Settings(BaseSettings):
     
     # === 模型配置 ===
     LLM_MODEL: str = Field(default="gemini-2.0-flash")
-    EMBEDDING_MODEL: str = Field(default="text-embedding-004")
+    EMBEDDING_MODEL: str = Field(default="gemini-embedding-001")
+    EMBEDDING_PROVIDER: str = Field(
+        default="google",
+        description="Embedding 提供方：google（默认）/ antigravity（OpenAI兼容）",
+    )
     
     # === RAG配置 ===
     CHUNK_SIZE: int = Field(default=500, description="子Chunk大小")
@@ -54,6 +67,9 @@ class Settings(BaseSettings):
     # === Knowledge Graph 配置 ===
     KG_MAX_CONCURRENCY: int = Field(default=3, description="知识图谱构建最大并发数")
     KG_MIN_REQUEST_INTERVAL_SEC: float = Field(default=4.0, description="知识图谱 LLM 请求最小间隔（秒）")
+    KG_LLM_TARGET_RPM: int = Field(default=0, description="知识图谱 LLM 目标 RPM（0=禁用，优先与最小间隔取更保守值）")
+    KG_EMBED_TARGET_RPM: int = Field(default=0, description="知识图谱 Embedding 目标 RPM（0=禁用）")
+    KG_MULTI_DOC_STRATEGY: str = Field(default="per_doc", description="多文档构图策略：per_doc（先子图后合并）/global（全局chunks一次构图）")
     KG_EXTRACTION_MAX_CHARS: int = Field(default=8000, description="知识图谱抽取输入文本最大长度（字符）")
     KG_MERGE_TARGET_CHARS: int = Field(default=4500, description="语义合并目标长度（字符）")
     KG_MERGE_MAX_CHARS: int = Field(default=7500, description="语义合并最大长度（字符）")

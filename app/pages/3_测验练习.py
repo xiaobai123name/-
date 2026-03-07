@@ -18,6 +18,7 @@ from backend.database.crud import DatabaseManager
 from backend.retrieval.vector_store import VectorStore
 from backend.learning.quiz_generator import QuizGenerator, QuizQuestion
 from backend.learning.knowledge_tracker import KnowledgeTracker
+from app.auth_cookie import ensure_auth_state_defaults, restore_user_from_cookie
 
 
 def _ensure_db_manager_class():
@@ -42,26 +43,6 @@ def _ensure_db_manager_class():
 
     return DatabaseManager
 
-# 导入 cookie 管理器
-try:
-    import extra_streamlit_components as stx
-    COOKIE_MANAGER_AVAILABLE = True
-    COOKIE_KEY = "app_user_id"
-    COOKIE_WIDGET_KEY = "app_cookie_manager"
-    _cookie_manager_quiz = None  # 模块级缓存
-except ImportError:
-    COOKIE_MANAGER_AVAILABLE = False
-
-
-def get_cookie_manager():
-    """获取 Cookie 管理器实例"""
-    if not COOKIE_MANAGER_AVAILABLE:
-        return None
-    global _cookie_manager_quiz
-    if _cookie_manager_quiz is None:
-        _cookie_manager_quiz = stx.CookieManager(key=COOKIE_WIDGET_KEY)
-    return _cookie_manager_quiz
-
 st.set_page_config(
     page_title="测验练习 - 学习伴侣",
     page_icon="📝",
@@ -71,6 +52,8 @@ st.set_page_config(
 
 def init_session():
     """初始化会话"""
+    ensure_auth_state_defaults()
+
     # 确保使用最新的 DatabaseManager（热更新后旧实例可能缺少新方法）
     needs_new_db = (
         "db_manager" not in st.session_state
@@ -87,19 +70,10 @@ def init_session():
         # 关联的 knowledge_tracker 也需要使用新的 db_manager
         st.session_state.knowledge_tracker = KnowledgeTracker(st.session_state.db_manager)
     
-    # 尝试从 cookie 恢复登录状态
-    if ("user" not in st.session_state or st.session_state.user is None) and COOKIE_MANAGER_AVAILABLE and not st.session_state.get("cookie_login_disabled", False):
-        cookie_manager = get_cookie_manager()
-        if cookie_manager:
-            user_id = cookie_manager.get(COOKIE_KEY)
-            if user_id:
-                user = st.session_state.db_manager.get_user_by_id(user_id)
-                if user:
-                    st.session_state.user = {
-                        "id": user.id,
-                        "username": user.username,
-                        "display_name": user.display_name
-                    }
+    restore_status = restore_user_from_cookie(st.session_state.db_manager)
+    if restore_status == "pending":
+        st.info("正在恢复登录状态...")
+        st.stop()
     
     if "user" not in st.session_state or st.session_state.user is None:
         st.warning("请先登录")

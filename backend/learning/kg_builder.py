@@ -16,11 +16,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict
 
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..config import settings
+from ..document.embedder import DocumentEmbedder
 from ..retrieval.vector_store import VectorStore
 from ..database.crud import DatabaseManager
 from ..llm.router import ModelRouter
@@ -337,6 +338,14 @@ class _KGAsyncContext:
     last_call_time: float = 0.0
 
 
+@dataclass
+class _KGMergedBatch:
+    """多文档全局构图时的合并批次（携带来源文档ID）。"""
+
+    text: str
+    document_ids: List[str]
+
+
 class KnowledgeGraphBuilder:
     """知识图谱构建器"""
 
@@ -494,7 +503,7 @@ class KnowledgeGraphBuilder:
     ):
         self.vector_store = vector_store
         self.db = db_manager
-        # Google key 仍用于 embeddings（语义合并/实体对齐/实体搜索）
+        # Google key 仍用于默认 LLM（无 user_id 场景兜底）
         self.api_key = api_key or settings.GOOGLE_API_KEY
         # 模型路由：按用户+模块选择不同 provider/model（仅影响 KG 的 LLM 抽取/对齐）
         self.model_router = ModelRouter(db_manager)
@@ -502,6 +511,24 @@ class KnowledgeGraphBuilder:
         # === 速率/并发配置（可通过 settings 扩展覆盖）===
         self.max_concurrency: int = int(getattr(settings, "KG_MAX_CONCURRENCY", 3))
         self.min_request_interval_sec: float = float(getattr(settings, "KG_MIN_REQUEST_INTERVAL_SEC", 4.0))
+        self.llm_target_rpm: int = int(getattr(settings, "KG_LLM_TARGET_RPM", 0))
+        self.embed_target_rpm: int = int(getattr(settings, "KG_EMBED_TARGET_RPM", 0))
+
+        # LLM 限速：若配置了目标 RPM，采用更保守的间隔（避免打满上限）
+        if self.llm_target_rpm > 0:
+            llm_interval = 60.0 / float(self.llm_target_rpm)
+            self.min_request_interval_sec = max(self.min_request_interval_sec, llm_interval)
+
+        # Embedding 限速：用于实体对齐/检索相关 embedding 调用
+        self.embed_min_request_interval_sec: float = 0.0
+        if self.embed_target_rpm > 0:
+            self.embed_min_request_interval_sec = 60.0 / float(self.embed_target_rpm)
+        self._embed_rate_lock = threading.Lock()
+        self._last_embed_call_time: float = 0.0
+
+        # 多文档构图策略：per_doc（先子图后合并）/global（全局 chunks 一次构图）
+        strategy = (getattr(settings, "KG_MULTI_DOC_STRATEGY", "per_doc") or "per_doc").strip().lower()
+        self.multi_doc_strategy: str = strategy if strategy in {"per_doc", "global"} else "per_doc"
 
         # 抽取与合并策略
         self.extraction_max_chars: int = int(getattr(settings, "KG_EXTRACTION_MAX_CHARS", 8000))
@@ -525,10 +552,8 @@ class KnowledgeGraphBuilder:
             convert_system_message_to_human=True,
         )
 
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model=settings.EMBEDDING_MODEL,
-            google_api_key=self.api_key,
-        )
+        # Embeddings：默认使用 Google；如需走 Antigravity 反代，可设置 EMBEDDING_PROVIDER=antigravity
+        self.embeddings = DocumentEmbedder()
 
         # 内存缓存：key -> KnowledgeGraph（单次进程内有效）
         self._graph_cache: Dict[str, KnowledgeGraph] = {}
@@ -562,11 +587,14 @@ class KnowledgeGraphBuilder:
     def _graph_key_for_document(self, document_id: str, llm_fp: str) -> str:
         return f"kg:doc:v{self.CACHE_VERSION}:{document_id}:m:{llm_fp}"
 
-    def _graph_key_for_documents(self, document_ids: List[str], align_entities: bool, llm_fp: str) -> str:
+    def _graph_key_for_documents(self, document_ids: List[str], align_entities: bool, llm_fp: str, strategy: str) -> str:
         # document_ids 可能很长，做一个短 fingerprint 避免 key 过长
         sorted_ids = sorted(set(document_ids))
         fingerprint = hashlib.md5("|".join(sorted_ids).encode("utf-8")).hexdigest()[:16]
-        return f"kg:multi:v{self.CACHE_VERSION}:{fingerprint}:align:{int(bool(align_entities))}:m:{llm_fp}"
+        s = (strategy or "per_doc").strip().lower()
+        if s not in {"per_doc", "global"}:
+            s = "per_doc"
+        return f"kg:multi:v{self.CACHE_VERSION}:{fingerprint}:align:{int(bool(align_entities))}:s:{s}:m:{llm_fp}"
 
     def _hash_chunks(self, chunks: List[Any]) -> str:
         """对 chunks 内容做稳定哈希，用于缓存失效判断"""
@@ -619,6 +647,58 @@ class KnowledgeGraphBuilder:
             rate_lock=asyncio.Lock(),
             last_call_time=0.0,
         )
+
+    @staticmethod
+    def _flatten_exception_messages(exc: BaseException) -> str:
+        """展开异常链并拼接消息，便于识别被 RetryError 包裹的根因。"""
+        seen: Set[int] = set()
+        stack: List[BaseException] = [exc]
+        parts: List[str] = []
+
+        while stack:
+            cur = stack.pop()
+            obj_id = id(cur)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+
+            parts.append(f"{type(cur).__name__}: {cur}")
+
+            cause = getattr(cur, "__cause__", None)
+            context = getattr(cur, "__context__", None)
+            if isinstance(cause, BaseException):
+                stack.append(cause)
+            if isinstance(context, BaseException):
+                stack.append(context)
+
+        return " | ".join(parts)
+
+    @classmethod
+    def _is_quota_or_rate_limit_error(cls, exc: BaseException) -> bool:
+        """判断异常链是否包含配额/速率限制错误。"""
+        msg = cls._flatten_exception_messages(exc).lower()
+        markers = [
+            "resource_exhausted",
+            "quota exceeded",
+            "rate limit",
+            "embed_content_free_tier_requests",
+            "requestsperminute",
+            "retrydelay",
+        ]
+        return any(m in msg for m in markers)
+
+    def _wait_embed_rate_limit_sync(self) -> None:
+        """Embedding 速率控制：保证相邻 embedding 请求间隔 >= embed_min_request_interval_sec。"""
+        if self.embed_min_request_interval_sec <= 0:
+            return
+
+        with self._embed_rate_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_embed_call_time
+            wait_sec = self.embed_min_request_interval_sec - elapsed
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            self._last_embed_call_time = time.monotonic()
 
     # ==================== Persistence Cache (SQLite) ====================
 
@@ -677,41 +757,6 @@ class KnowledgeGraphBuilder:
             meta=meta,
         )
 
-    def save_graph_snapshot(self, graph: KnowledgeGraph, snapshot_dir: Optional[str] = None) -> str:
-        """
-        将图谱保存为快照文件（pickle）。
-
-        说明：
-        - 快照用于调试/留档/对比，不参与缓存命中逻辑。
-        - 为避免类结构变化导致旧快照不可读，快照保存 graph.to_dict()。
-        """
-        import pickle
-        from datetime import datetime
-        from pathlib import Path
-
-        base_dir = Path(snapshot_dir) if snapshot_dir else (settings.BASE_DIR / "data" / "snapshots")
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M")
-        node_count = len(graph.entities)
-
-        # 与现有命名保持一致：graph_YYYYMMDD_HHMM_{n}nodes.pkl
-        path = base_dir / f"graph_{ts}_{node_count}nodes.pkl"
-        if path.exists():
-            # 同一分钟内多次保存时避免覆盖
-            i = 1
-            while True:
-                candidate = base_dir / f"graph_{ts}_{node_count}nodes_{i}.pkl"
-                if not candidate.exists():
-                    path = candidate
-                    break
-                i += 1
-
-        with open(path, "wb") as f:
-            pickle.dump(graph.to_dict(), f, protocol=pickle.HIGHEST_PROTOCOL)
-
-        return str(path)
-    
     def _generate_entity_id(self, name: str, entity_type: str) -> str:
         """生成实体ID"""
         raw = f"{name}_{entity_type}"
@@ -933,6 +978,7 @@ class KnowledgeGraphBuilder:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _embed_documents_batch_with_retry(self, texts: List[str]) -> List[List[float]]:
         """对单个 batch 做 embedding（带重试）。"""
+        self._wait_embed_rate_limit_sync()
         return self.embeddings.embed_documents(texts)
 
     def _embed_documents_with_retry(self, texts: List[str]) -> List[List[float]]:
@@ -951,6 +997,7 @@ class KnowledgeGraphBuilder:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _embed_query_with_retry(self, query: str) -> List[float]:
+        self._wait_embed_rate_limit_sync()
         return self.embeddings.embed_query(query)
 
     # ==================== LLM Calls (async + semaphore + rate limit + retry) ====================
@@ -1076,15 +1123,124 @@ class KnowledgeGraphBuilder:
             merged.append(sep.join(cur_texts))
 
         return merged
+
+    def _size_merge_records(self, records: List[Tuple[str, str]]) -> List[_KGMergedBatch]:
+        """全局多文档模式下的纯长度合并（保留来源文档ID）。"""
+        merged: List[_KGMergedBatch] = []
+        buf_texts: List[str] = []
+        buf_doc_ids: Set[str] = set()
+        buf_len = 0
+        sep = "\n\n---\n\n"
+
+        for text, did in records:
+            t = (text or "").strip()
+            if not t:
+                continue
+            t_len = len(t)
+
+            if t_len >= self.merge_max_chars:
+                if buf_texts:
+                    merged.append(_KGMergedBatch(text=sep.join(buf_texts), document_ids=sorted(buf_doc_ids)))
+                    buf_texts, buf_doc_ids, buf_len = [], set(), 0
+                merged.append(_KGMergedBatch(text=t[: self.merge_max_chars], document_ids=[did] if did else []))
+                continue
+
+            if buf_texts and (buf_len + len(sep) + t_len) > self.merge_max_chars:
+                merged.append(_KGMergedBatch(text=sep.join(buf_texts), document_ids=sorted(buf_doc_ids)))
+                buf_texts, buf_doc_ids, buf_len = [], set(), 0
+
+            buf_texts.append(t)
+            if did:
+                buf_doc_ids.add(did)
+            buf_len = buf_len + (len(sep) if buf_len > 0 else 0) + t_len
+
+            if buf_len >= self.merge_target_chars:
+                merged.append(_KGMergedBatch(text=sep.join(buf_texts), document_ids=sorted(buf_doc_ids)))
+                buf_texts, buf_doc_ids, buf_len = [], set(), 0
+
+        if buf_texts:
+            merged.append(_KGMergedBatch(text=sep.join(buf_texts), document_ids=sorted(buf_doc_ids)))
+
+        return merged
+
+    def _semantic_merge_chunks_global(self, chunks: List[Any]) -> List[_KGMergedBatch]:
+        """
+        多文档全局构图：将所有文档父 chunks 合并为批次，同时保留每个批次来源文档ID。
+        """
+        records: List[Tuple[str, str]] = []
+        for c in chunks:
+            text = (getattr(c, "content", "") or "").strip()
+            if not text:
+                continue
+            did = (getattr(c, "document_id", "") or "").strip()
+            records.append((text, did))
+
+        if len(records) <= 1:
+            if not records:
+                return []
+            only_text, only_did = records[0]
+            return [_KGMergedBatch(text=only_text, document_ids=[only_did] if only_did else [])]
+
+        texts = [t for t, _ in records]
+        try:
+            embeddings = self._embed_documents_with_retry(texts)
+        except Exception:
+            return self._size_merge_records(records)
+
+        merged: List[_KGMergedBatch] = []
+        sep = "\n\n---\n\n"
+
+        cur_texts: List[str] = [records[0][0]]
+        cur_doc_ids: Set[str] = set([records[0][1]] if records[0][1] else [])
+        cur_len = len(records[0][0])
+        cur_emb = embeddings[0]
+        cur_count = 1
+
+        for i in range(1, len(records)):
+            t, did = records[i]
+            emb = embeddings[i]
+
+            sim = self._cosine_similarity(cur_emb, emb)
+            would_len = cur_len + len(sep) + len(t)
+
+            should_merge = (sim >= self.semantic_merge_threshold) and (would_len <= self.merge_max_chars)
+            if not should_merge and cur_len < int(self.merge_target_chars * 0.6) and would_len <= self.merge_max_chars:
+                should_merge = True
+
+            if should_merge:
+                cur_texts.append(t)
+                if did:
+                    cur_doc_ids.add(did)
+                cur_len = would_len
+                cur_emb = [(a * cur_count + b) / (cur_count + 1) for a, b in zip(cur_emb, emb)]
+                cur_count += 1
+                continue
+
+            merged.append(_KGMergedBatch(text=sep.join(cur_texts), document_ids=sorted(cur_doc_ids)))
+            cur_texts = [t]
+            cur_doc_ids = set([did] if did else [])
+            cur_len = len(t)
+            cur_emb = emb
+            cur_count = 1
+
+        if cur_texts:
+            merged.append(_KGMergedBatch(text=sep.join(cur_texts), document_ids=sorted(cur_doc_ids)))
+
+        return merged
     
     async def _extract_from_text_async(
         self,
         text: str,
         document_id: str,
+        document_ids: Optional[List[str]],
         user_id: str,
         ctx: _KGAsyncContext,
     ) -> Tuple[List[Entity], List[Relation]]:
         """异步抽取实体与关系（并发 + 限流 + 重试）。"""
+        norm_doc_ids = sorted(set([d for d in (document_ids or [document_id]) if d]))
+        if not norm_doc_ids and document_id:
+            norm_doc_ids = [document_id]
+
         # SiliconFlow/Qwen 使用更强约束的纯 JSON prompt，减少不闭合 ``` / [] 导致的解析失败
         prompt_tpl = self.EXTRACTION_PROMPT
         is_siliconflow = False
@@ -1163,7 +1319,7 @@ class KnowledgeGraphBuilder:
                 name=name,
                 type=entity_type,
                 description=(e.get("description") or "").strip(),
-                document_ids=[document_id],
+                document_ids=list(norm_doc_ids),
             )
             entities.append(entity)
             entity_name_to_id[name] = entity_id
@@ -1195,7 +1351,7 @@ class KnowledgeGraphBuilder:
                 target_id=target_id,
                 type=rel_type,
                 description=(r.get("description") or None),
-                document_ids=[document_id],
+                document_ids=list(norm_doc_ids),
             )
             relations.append(relation)
 
@@ -1212,7 +1368,13 @@ class KnowledgeGraphBuilder:
         async def _runner():
             ctx = self._new_async_context()
             uid = user_id or ""
-            return await self._extract_from_text_async(text=text, document_id=document_id, user_id=uid, ctx=ctx)
+            return await self._extract_from_text_async(
+                text=text,
+                document_id=document_id,
+                document_ids=[document_id],
+                user_id=uid,
+                ctx=ctx,
+            )
 
         return self._run_async(_runner())
     
@@ -1370,7 +1532,13 @@ class KnowledgeGraphBuilder:
             return graph
 
         tasks = [
-            self._extract_from_text_async(text=t, document_id=document_id, user_id=user_id, ctx=ctx)
+            self._extract_from_text_async(
+                text=t,
+                document_id=document_id,
+                document_ids=[document_id],
+                user_id=user_id,
+                ctx=ctx,
+            )
             for t in merged_texts
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1456,7 +1624,13 @@ class KnowledgeGraphBuilder:
             return KnowledgeGraph()
 
         llm_fp = self._llm_fingerprint(user_id)
-        graph_key = self._graph_key_for_documents(doc_ids, align_entities=align_entities, llm_fp=llm_fp)
+        strategy = self.multi_doc_strategy
+        graph_key = self._graph_key_for_documents(
+            doc_ids,
+            align_entities=align_entities,
+            llm_fp=llm_fp,
+            strategy=strategy,
+        )
         mem_key = self._mem_cache_key(user_id, graph_key)
 
         # 1) 内存缓存
@@ -1499,44 +1673,115 @@ class KnowledgeGraphBuilder:
                     "documents": len(doc_ids),
                     "aligned": bool(align_entities),
                     "single_doc_shortcut": True,
+                    "strategy": strategy,
                 },
             )
             return g
 
-        # 4) 并发构建每个文档子图（共享 ctx：统一限流/并发）
-        ctx = self._new_async_context()
-        tasks = [self.build_from_document_async(document_id=did, user_id=user_id, ctx=ctx) for did in doc_ids]
-        doc_graphs = await asyncio.gather(*tasks, return_exceptions=True)
-
         merged_graph = KnowledgeGraph()
-        existing_rel_ids: Set[str] = set()
+        alignment_applied = False
+        alignment_warning: Optional[str] = None
+        mode = "per_doc"
+        merged_batches_count = 0
+        err_count = 0
 
-        for g in doc_graphs:
-            if isinstance(g, Exception):
-                continue
+        if strategy == "global":
+            mode = "global"
+            ctx = self._new_async_context()
 
-            # 合并实体
-            for entity_id, entity in g.entities.items():
-                if entity_id not in merged_graph.entities:
-                    merged_graph.entities[entity_id] = entity
-                else:
-                    existing = merged_graph.entities[entity_id]
-                    for did in entity.document_ids:
-                        if did not in existing.document_ids:
-                            existing.document_ids.append(did)
+            all_chunks: List[Any] = []
+            for did in doc_ids:
+                all_chunks.extend(self._get_parent_chunks_for_kg(did))
 
-            # 合并关系（去重）
-            for relation in g.relations:
-                if relation.id in existing_rel_ids:
+            merged_batches = self._semantic_merge_chunks_global(all_chunks)
+            merged_batches_count = len(merged_batches)
+
+            if merged_batches:
+                tasks = [
+                    self._extract_from_text_async(
+                        text=batch.text,
+                        document_id=(batch.document_ids[0] if batch.document_ids else ""),
+                        document_ids=(batch.document_ids or list(doc_ids)),
+                        user_id=user_id,
+                        ctx=ctx,
+                    )
+                    for batch in merged_batches
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                existing_rel_ids: Set[str] = set()
+                for res in results:
+                    if isinstance(res, Exception):
+                        err_count += 1
+                        continue
+
+                    entities, relations = res
+                    for entity in entities:
+                        if entity.id not in merged_graph.entities:
+                            merged_graph.entities[entity.id] = entity
+                        else:
+                            existing = merged_graph.entities[entity.id]
+                            for did in entity.document_ids:
+                                if did not in existing.document_ids:
+                                    existing.document_ids.append(did)
+
+                    for relation in relations:
+                        if relation.id in existing_rel_ids:
+                            continue
+                        existing_rel_ids.add(relation.id)
+                        merged_graph.relations.append(relation)
+
+                if results and err_count == len(results):
+                    raise RuntimeError("知识图谱构建失败：LLM 调用全部失败。请检查模型配置/API 或稍后重试。")
+
+                if results and err_count > 0 and (len(merged_graph.entities) == 0 and len(merged_graph.relations) == 0):
+                    raise RuntimeError("知识图谱构建失败：部分调用失败且结果为空。建议检查模型超时/速率限制。")
+        else:
+            # 默认策略：先并发构建每个文档子图，再合并
+            mode = "per_doc"
+            ctx = self._new_async_context()
+            tasks = [self.build_from_document_async(document_id=did, user_id=user_id, ctx=ctx) for did in doc_ids]
+            doc_graphs = await asyncio.gather(*tasks, return_exceptions=True)
+            merged_batches_count = len(doc_ids)
+
+            existing_rel_ids: Set[str] = set()
+            for g in doc_graphs:
+                if isinstance(g, Exception):
+                    err_count += 1
                     continue
-                existing_rel_ids.add(relation.id)
-                merged_graph.relations.append(relation)
 
-        # 5) 实体对齐（可选）
+                for entity_id, entity in g.entities.items():
+                    if entity_id not in merged_graph.entities:
+                        merged_graph.entities[entity_id] = entity
+                    else:
+                        existing = merged_graph.entities[entity_id]
+                        for did in entity.document_ids:
+                            if did not in existing.document_ids:
+                                existing.document_ids.append(did)
+
+                for relation in g.relations:
+                    if relation.id in existing_rel_ids:
+                        continue
+                    existing_rel_ids.add(relation.id)
+                    merged_graph.relations.append(relation)
+
+        # 实体对齐（可选）
         if align_entities and len(merged_graph.entities) > 1:
-            merged_graph = await self._align_entities_async(merged_graph, ctx=ctx, user_id=user_id)
+            try:
+                merged_graph = await self._align_entities_async(merged_graph, ctx=ctx, user_id=user_id)
+                alignment_applied = True
+            except Exception as e:
+                # 免费额度/速率限制下，对齐阶段可能失败。此时降级为“未对齐图谱”而非整次构建失败。
+                if self._is_quota_or_rate_limit_error(e):
+                    detail = self._flatten_exception_messages(e)
+                    alignment_warning = "实体对齐阶段触发 API 配额或速率限制，已自动降级为未对齐图谱。"
+                    if detail:
+                        alignment_warning += f" 详细信息：{detail}"
+                    setattr(merged_graph, "build_warning", alignment_warning)
+                else:
+                    raise
 
-        # 6) 写入缓存（内存 + SQLite）
+        # 写入缓存（内存 + SQLite）
         self._graph_cache[mem_key] = merged_graph
         self._save_graph_to_persistent_cache(
             user_id=user_id,
@@ -1549,7 +1794,13 @@ class KnowledgeGraphBuilder:
                 "cache_version": self.CACHE_VERSION,
                 "documents": len(doc_ids),
                 "aligned": bool(align_entities),
+                "alignment_applied": bool(alignment_applied),
                 "alignment_direct_threshold": self.alignment_direct_threshold,
+                "alignment_warning": (alignment_warning[:300] if alignment_warning else None),
+                "strategy": strategy,
+                "mode": mode,
+                "merged_batches": int(merged_batches_count),
+                "err_count": int(err_count),
             },
         )
 
@@ -1974,24 +2225,22 @@ class KnowledgeGraphBuilder:
     def build_global_graph_fast(
         self,
         user_id: str,
-        save_snapshot: bool = True,
         max_chars_per_doc: int = 8000
-    ) -> Tuple[KnowledgeGraph, Optional[str]]:
+    ) -> KnowledgeGraph:
         """
         快速构建用户所有文档的全局知识图谱
         
         Args:
             user_id: 用户ID
-            save_snapshot: 是否自动保存快照
             max_chars_per_doc: 每个文档的最大字符数
             
         Returns:
-            Tuple[KnowledgeGraph, Optional[str]]: (图谱对象, 快照文件路径或None)
+            KnowledgeGraph: 图谱对象
         """
         # 获取用户所有已完成处理的文档
         docs = self.db.get_user_documents(user_id, status="completed")
         if not docs:
-            return KnowledgeGraph(), None
+            return KnowledgeGraph()
         
         # 收集所有文档的文本
         all_texts = []
@@ -2007,7 +2256,7 @@ class KnowledgeGraphBuilder:
                 doc_ids.append(doc.id)
         
         if not all_texts:
-            return KnowledgeGraph(), None
+            return KnowledgeGraph()
         
         # 合并所有文本
         combined_text = "\n\n===\n\n".join(all_texts)
@@ -2027,7 +2276,7 @@ class KnowledgeGraphBuilder:
             result = self._parse_extraction_response(getattr(response, "content", "") or "")
         except Exception as e:
             print(f"LLM 调用失败: {e}")
-            return KnowledgeGraph(), None
+            return KnowledgeGraph()
         
         # 构建图谱（使用第一个文档ID作为来源标记）
         primary_doc_id = doc_ids[0] if doc_ids else "unknown"
@@ -2039,34 +2288,27 @@ class KnowledgeGraphBuilder:
         for relation in graph.relations:
             relation.document_ids = doc_ids
         
-        # 保存快照
-        snapshot_path = None
-        if save_snapshot and len(graph.entities) > 0:
-            snapshot_path = self.save_graph_snapshot(graph)
-        
-        return graph, snapshot_path
+        return graph
 
     def build_global_graph(
         self,
         user_id: str,
-        align_entities: bool = True,
-        save_snapshot: bool = True
-    ) -> Tuple[KnowledgeGraph, Optional[str]]:
+        align_entities: bool = True
+    ) -> KnowledgeGraph:
         """
         构建用户所有文档的全局知识图谱
         
         Args:
             user_id: 用户ID
             align_entities: 是否进行实体对齐
-            save_snapshot: 是否自动保存快照
             
         Returns:
-            Tuple[KnowledgeGraph, Optional[str]]: (图谱对象, 快照文件路径或None)
+            KnowledgeGraph: 图谱对象
         """
         # 获取用户所有已完成处理的文档
         docs = self.db.get_user_documents(user_id, status="completed")
         if not docs:
-            return KnowledgeGraph(), None
+            return KnowledgeGraph()
         
         doc_ids = [doc.id for doc in docs]
         
@@ -2077,9 +2319,4 @@ class KnowledgeGraphBuilder:
             align_entities=align_entities
         )
         
-        # 保存快照
-        snapshot_path = None
-        if save_snapshot and len(graph.entities) > 0:
-            snapshot_path = self.save_graph_snapshot(graph)
-        
-        return graph, snapshot_path
+        return graph

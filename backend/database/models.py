@@ -62,7 +62,7 @@ class UserModelPreference(Base):
     # 模型名称，例如：gemini-2.0-flash / Qwen2.5-7B-Instruct
     model = Column(String(100), nullable=False)
 
-    # 可选：OpenAI 兼容 API base（例如硅基流动）
+    # 可选：OpenAI 兼容 API base（例如：硅基流动 / Antigravity 反代）
     api_base = Column(String(255), nullable=True)
 
     # 可选：该模块使用的温度
